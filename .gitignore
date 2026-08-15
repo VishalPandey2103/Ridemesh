@@ -1,0 +1,75 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.npm
+
+# Lockfiles from other package managers (npm workspaces is the source of truth)
+yarn.lock
+pnpm-lock.yaml
+
+# Environment / secrets — .env.example is committed, real .env files are not
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Test / coverage output
+coverage/
+*.lcov
+.nyc_output/
+
+# Load test output (k6)
+scripts/k6/*.json
+scripts/k6/summary.html
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Local data volumes / dumps
+data/
+pgdata/
+*.sqlite
+*.sqlite3
+*.dump
+
+# Caches
+.cache/
+.eslintcache
+.parcel-cache/
+.vite/
+tmp/
+temp/
+
+# Editors
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

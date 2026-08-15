@@ -1,0 +1,27 @@
+{
+  "name": "ridemesh",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Distributed ride-hailing backend (Uber/Ola-lite) - 8 microservices, Redis GEO, Socket.IO, RabbitMQ sagas, outbox, surge pricing",
+  "workspaces": [
+    "shared",
+    "services/*"
+  ],
+  "scripts": {
+    "test": "node --test \"shared/test/*.test.js\" \"services/*/test/*.test.js\"",
+    "demo": "node scripts/demo-ride.js",
+    "simulate:drivers": "node scripts/simulate-drivers.js",
+    "up": "docker compose up --build -d",
+    "down": "docker compose down -v",
+    "logs": "docker compose logs -f --tail=100"
+  },
+  "dependencies": {
+    "@opentelemetry/auto-instrumentations-node": "^0.50.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.53.0",
+    "@opentelemetry/sdk-node": "^0.53.0"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.7.5"
+  }
+}
