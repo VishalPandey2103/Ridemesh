@@ -1,0 +1,12 @@
+{
+  "name": "@ridemesh/location-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ridemesh/shared": "*",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "@socket.io/redis-adapter": "^8.3.0",
+    "ioredis": "^5.4.1"
+  }
+}
