@@ -21,11 +21,11 @@ import { callService } from '@ridemesh/shared/src/http.js';
  *
  * Rooms as the addressing scheme:
  *   driver:{driverId} — exactly one driver's device(s); offers go here.
- *   trip:{tripId}     — everyone watching a trip (the rider); status
- *                       updates go here.
+ *   trip:{tripId}     — everyone watching a trip (the rider); live driver
+ *                       GPS and status updates go here.
  *
- * Server->client events:  ride:offer, ride:offer_expired, trip:update
- * Client->server events:  offer:response, trip:status, trip:subscribe
+ * Server->client events:  ride:offer, ride:offer_expired, driver:location, trip:update
+ * Client->server events:  driver:ping, offer:response, trip:status, trip:subscribe
  */
 export function attachSockets({ httpServer, geo, env, logger, metrics }) {
   const pubClient = createRedis(env.REDIS_URL);
@@ -34,6 +34,7 @@ export function attachSockets({ httpServer, geo, env, logger, metrics }) {
   io.adapter(createAdapter(pubClient, subClient));
 
   const wsConnections = metrics.gauge('ws_connections', 'Open WebSocket connections', ['role']);
+  const pingsCounter = metrics.counter('driver_pings_total', 'Driver location pings received');
 
   // --- handshake auth: no valid JWT, no socket. --------------------------
   io.use((socket, next) => {
@@ -58,6 +59,33 @@ export function attachSockets({ httpServer, geo, env, logger, metrics }) {
       const current = await geo.getStatus(userId);
       if (current !== 'on_trip') await geo.setStatus(userId, 'online');
     }
+
+    // ---------------------------------------------------- driver:ping ----
+    // Every ~4s: update the GEO index; if on_trip, also fan out to the
+    // rider's room and record a route breadcrumb in trip-service.
+    let pingSeq = 0;
+    socket.on('driver:ping', async (msg) => {
+      if (role !== 'driver') return;
+      const lat = Number(msg?.lat), lng = Number(msg?.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      pingsCounter.inc({ service: metrics.service });
+      try {
+        await geo.upsertDriver(userId, lat, lng);
+        const tripId = await geo.getActiveTrip(userId);
+        if (tripId) {
+          io.to(`trip:${tripId}`).emit('driver:location', { tripId, lat, lng, ts: Date.now() });
+          // Sample 1-in-2 breadcrumbs to trip-service — billing distance
+          // doesn't need every ping, and this halves write volume.
+          if (pingSeq++ % 2 === 0) {
+            callService('trip', `${env.TRIP_SERVICE_URL}/internal/trips/${tripId}/route`, {
+              method: 'POST', body: { lat, lng }
+            }).catch((e) => logger.warn({ err: e.message }, 'route breadcrumb failed'));
+          }
+        }
+      } catch (e) {
+        logger.error({ err: e.message }, 'ping handling failed');
+      }
+    });
 
     // ------------------------------------------------- offer:response ----
     // Driver accepted/rejected an offer. Matching-service owns offer state,
