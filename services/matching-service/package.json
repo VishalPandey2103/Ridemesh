@@ -1,0 +1,11 @@
+{
+  "name": "@ridemesh/matching-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ridemesh/shared": "*",
+    "express": "^4.19.2",
+    "@socket.io/redis-emitter": "^5.1.0",
+    "ioredis": "^5.4.1"
+  }
+}
