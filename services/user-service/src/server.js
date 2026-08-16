@@ -3,16 +3,19 @@ import bcrypt from 'bcryptjs';
 import pg from 'pg';
 import { createLogger, httpLogger } from '@ridemesh/shared/src/logger.js';
 import { requireEnv } from '@ridemesh/shared/src/env.js';
-import { signToken, userFromHeaders } from '@ridemesh/shared/src/auth.js';
+import { signToken, userFromHeaders, requireUser } from '@ridemesh/shared/src/auth.js';
 import { ApiError, asyncHandler, errorHandler, notFound } from '@ridemesh/shared/src/errors.js';
 import { initMetrics } from '@ridemesh/shared/src/metrics.js';
 
 /**
  * User Service — owns identity for both entity types.
  *
- * Riders and drivers share the users table but register differently: a rider
- * needs only name/phone/password, while a driver additionally submits
- * vehicle_no + license_no and starts in kyc_status='pending'.
+ * Riders and drivers share the users table but have different verification
+ * flows: a rider is usable after phone verification (simulated as immediate
+ * here); a driver additionally submits vehicle_no + license_no and starts in
+ * kyc_status='pending'. Matching only dispatches to drivers, and a real
+ * deployment would gate driver logins on kyc_status='approved' — the field
+ * and the approval endpoint exist so that story is demonstrable.
  */
 const env = requireEnv(['PORT', 'DATABASE_URL', 'JWT_SECRET']);
 const logger = createLogger('user-service');
@@ -68,6 +71,38 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
   }
   const { password_hash, ...safe } = user;
   res.json({ user: safe, token: signToken(user) });
+}));
+
+// -------------------------------------------------------------- me / kyc
+app.get('/api/users/me', requireUser, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, role, name, phone, vehicle_no, license_no, kyc_status, rating, created_at
+     FROM users WHERE id = $1`, [req.user.id]);
+  if (!rows[0]) throw new ApiError(404, 'User not found');
+  res.json(rows[0]);
+}));
+
+// Simulated back-office approval (no admin auth in dev; note in README).
+app.post('/api/users/:id/kyc', asyncHandler(async (req, res) => {
+  const { status } = req.body || {};
+  if (!['approved', 'rejected'].includes(status)) throw new ApiError(400, 'status must be approved|rejected');
+  const { rows } = await pool.query(
+    `UPDATE users SET kyc_status = $2 WHERE id = $1 AND role = 'driver' RETURNING id, kyc_status`,
+    [req.params.id, status]);
+  if (!rows[0]) throw new ApiError(404, 'Driver not found');
+  res.json(rows[0]);
+}));
+
+// ------------------------------------------------- internal: batch profiles
+// Matching-service pulls ratings for ranking via this batch endpoint rather
+// than reading users_db directly — data ownership stays intact, and one
+// round-trip serves N candidates.
+app.get('/internal/users', asyncHandler(async (req, res) => {
+  const ids = String(req.query.ids || '').split(',').filter(Boolean);
+  if (!ids.length) return res.json({ users: [] });
+  const { rows } = await pool.query(
+    `SELECT id, role, name, rating, kyc_status FROM users WHERE id = ANY($1::uuid[])`, [ids]);
+  res.json({ users: rows });
 }));
 
 app.use(notFound);
