@@ -9,10 +9,12 @@ import { rankCandidates } from './rank.js';
  * Flow per ride.requested event:
  *   1. Ask location-service for nearby online drivers (Redis GEO under it).
  *   2. Enrich with ratings (user-service batch API), rank.
- *   3. Offer the ride to the best-ranked driver:
+ *   3. For up to MAX_CANDIDATES, one at a time (sequential offers, the
+ *      Uber/Ola model — broadcast-to-all causes accept-races and driver
+ *      annoyance):
  *        a. Acquire the distributed lock lock:driver:{id}. If another trip's
- *           dispatcher holds it, that driver is being offered a ride RIGHT
- *           NOW. This lock is what prevents double-dispatch.
+ *           dispatcher holds it, skip — that driver is being offered a ride
+ *           RIGHT NOW. This lock is what prevents double-dispatch.
  *        b. Emit ride:offer into the driver's Socket.IO room via the Redis
  *           emitter (we hold no sockets; location-service delivers it).
  *        c. Block up to 15s for the response. Implementation: the respond
@@ -22,12 +24,14 @@ import { rankCandidates } from './rank.js';
  *           timeout IS the offer expiry. (A dedicated duplicate connection
  *           is required: a blocked connection can serve nothing else.)
  *        d. accept  -> mark driver on_trip, publish ride.driver_assigned, done.
- *   4. No acceptance -> publish ride.unmatched (trip-service marks no_drivers).
+ *           reject/timeout -> release lock, notify driver UI, next candidate.
+ *   4. Exhausted -> publish ride.unmatched (trip-service marks no_drivers).
  *
  * Offer state lives in Redis with a TTL (offer:{id}) so a late "accept"
  * after timeout is verifiably rejected rather than silently honored.
  */
 const OFFER_TIMEOUT_S = 15;
+const MAX_CANDIDATES = 5;
 const SEARCH_RADIUS_M = 4000;
 const LOCK_TTL_MS = (OFFER_TIMEOUT_S + 5) * 1000; // outlive the offer window
 
@@ -69,61 +73,67 @@ export function createDispatcher({ redis, emitter, bus, env, logger, metrics }) 
     logger.info({ tripId: trip.tripId }, 'dispatch started');
 
     const ranked = rankCandidates(await fetchCandidates(trip));
-    const candidate = ranked[0];
+    for (const candidate of ranked.slice(0, MAX_CANDIDATES)) {
+      // Rider may have cancelled while we were offering to earlier drivers.
+      if (await redis.get(`dispatch:cancelled:${trip.tripId}`)) {
+        logger.info({ tripId: trip.tripId }, 'dispatch aborted: trip cancelled');
+        return;
+      }
 
-    if (candidate) {
       const lockKey = `lock:driver:${candidate.driverId}`;
       const lockToken = await acquireLock(redis, lockKey, LOCK_TTL_MS);
+      if (!lockToken) continue; // driver is mid-offer for another trip
 
-      if (lockToken) {
-        const offerId = crypto.randomUUID();
-        await redis.set(`offer:${offerId}`,
-          JSON.stringify({ tripId: trip.tripId, driverId: candidate.driverId, state: 'pending' }),
-          'EX', OFFER_TIMEOUT_S + 10);
+      const offerId = crypto.randomUUID();
+      await redis.set(`offer:${offerId}`,
+        JSON.stringify({ tripId: trip.tripId, driverId: candidate.driverId, state: 'pending' }),
+        'EX', OFFER_TIMEOUT_S + 10);
 
-        offersSent.inc({ service: metrics.service });
-        emitter.to(`driver:${candidate.driverId}`).emit('ride:offer', {
-          offerId,
+      offersSent.inc({ service: metrics.service });
+      emitter.to(`driver:${candidate.driverId}`).emit('ride:offer', {
+        offerId,
+        tripId: trip.tripId,
+        pickup: { lat: trip.pickupLat, lng: trip.pickupLng },
+        drop: { lat: trip.dropLat, lng: trip.dropLng },
+        fareEstimatePaise: trip.fareEstimatePaise,
+        surge: trip.surge,
+        distToPickupM: candidate.distM,
+        expiresInMs: OFFER_TIMEOUT_S * 1000
+      });
+
+      const outcome = await waitForResponse(offerId, OFFER_TIMEOUT_S);
+
+      if (outcome === 'accept') {
+        // Flip availability BEFORE announcing: once on_trip, the driver
+        // vanishes from every future findNearby, closing the race where a
+        // second dispatcher sees them between assign and status-flip.
+        await callService('location',
+          `${env.LOCATION_SERVICE_URL}/internal/drivers/${candidate.driverId}/status`,
+          { method: 'POST', body: { status: 'on_trip', tripId: trip.tripId } });
+        await bus.publish(EVENTS.DRIVER_ASSIGNED, {
+          tripId: trip.tripId, riderId: trip.riderId,
+          driverId: candidate.driverId, offerId, distToPickupM: candidate.distM
+        });
+        // Tell the driver's device it won the offer (rider learns via the
+        // trip:update push that trip-service emits on consuming the event).
+        emitter.to(`driver:${candidate.driverId}`).emit('trip:assigned', {
           tripId: trip.tripId,
           pickup: { lat: trip.pickupLat, lng: trip.pickupLng },
-          drop: { lat: trip.dropLat, lng: trip.dropLng },
-          fareEstimatePaise: trip.fareEstimatePaise,
-          surge: trip.surge,
-          distToPickupM: candidate.distM,
-          expiresInMs: OFFER_TIMEOUT_S * 1000
+          drop: { lat: trip.dropLat, lng: trip.dropLng }
         });
-
-        const outcome = await waitForResponse(offerId, OFFER_TIMEOUT_S);
-
-        if (outcome === 'accept') {
-          // Flip availability BEFORE announcing: once on_trip, the driver
-          // vanishes from every future findNearby, closing the race where a
-          // second dispatcher sees them between assign and status-flip.
-          await callService('location',
-            `${env.LOCATION_SERVICE_URL}/internal/drivers/${candidate.driverId}/status`,
-            { method: 'POST', body: { status: 'on_trip', tripId: trip.tripId } });
-          await bus.publish(EVENTS.DRIVER_ASSIGNED, {
-            tripId: trip.tripId, riderId: trip.riderId,
-            driverId: candidate.driverId, offerId, distToPickupM: candidate.distM
-          });
-          // Tell the driver's device it won the offer (rider learns via the
-          // trip:update push that trip-service emits on consuming the event).
-          emitter.to(`driver:${candidate.driverId}`).emit('trip:assigned', {
-            tripId: trip.tripId,
-            pickup: { lat: trip.pickupLat, lng: trip.pickupLng },
-            drop: { lat: trip.dropLat, lng: trip.dropLng }
-          });
-          await releaseLock(redis, lockKey, lockToken); // safe: status now guards
-          dispatchMatched.inc({ service: metrics.service });
-          logger.info({ tripId: trip.tripId, driverId: candidate.driverId }, 'matched');
-          return;
-        }
-
-        // reject or timeout: clean up the offer and let the lock go.
-        await redis.del(`offer:${offerId}`);
-        await releaseLock(redis, lockKey, lockToken);
-        logger.info({ tripId: trip.tripId, driverId: candidate.driverId, outcome }, 'candidate declined');
+        await releaseLock(redis, lockKey, lockToken); // safe: status now guards
+        dispatchMatched.inc({ service: metrics.service });
+        logger.info({ tripId: trip.tripId, driverId: candidate.driverId }, 'matched');
+        return;
       }
+
+      // reject or timeout: clean up and cascade to the next candidate.
+      await redis.del(`offer:${offerId}`);
+      await releaseLock(redis, lockKey, lockToken);
+      if (outcome === 'timeout') {
+        emitter.to(`driver:${candidate.driverId}`).emit('ride:offer_expired', { offerId });
+      }
+      logger.info({ tripId: trip.tripId, driverId: candidate.driverId, outcome }, 'candidate declined');
     }
 
     dispatchUnmatched.inc({ service: metrics.service });
