@@ -1,5 +1,5 @@
 import { createRedis } from '@ridemesh/shared/src/redis.js';
-import { cellForLocation } from '@ridemesh/shared/src/geo.js';
+import { cellForLocation, minuteBucket } from '@ridemesh/shared/src/geo.js';
 
 /**
  * Sharded Redis GEO index of online drivers.
@@ -39,7 +39,7 @@ function hashStr(s) {
 export class GeoIndex {
   constructor({ geoUrls, metaUrl }) {
     this.shards = geoUrls.map((u) => createRedis(u));
-    this.meta = createRedis(metaUrl); // shard mapping
+    this.meta = createRedis(metaUrl); // status, trip mapping, supply counters
   }
 
   shardIndexFor(lat, lng) {
@@ -56,6 +56,15 @@ export class GeoIndex {
     }
     await this.shards[idx].geoadd(GEO_KEY, lng, lat, driverId);
     await this.meta.set(`driver:shard:${driverId}`, String(idx));
+
+    // Surge supply signal: which distinct drivers pinged in this cell this
+    // minute. SADD is idempotent per driver, so 15 pings = 1 unit of supply.
+    const cell = cellForLocation(lat, lng, 6);
+    const bucket = minuteBucket();
+    await this.meta.sadd(`supply:${cell}:${bucket}`, driverId);
+    await this.meta.expire(`supply:${cell}:${bucket}`, 180);
+    await this.meta.sadd(`surge:cells:${bucket}`, cell);
+    await this.meta.expire(`surge:cells:${bucket}`, 180);
   }
 
   async removeDriver(driverId) {
@@ -65,8 +74,8 @@ export class GeoIndex {
   }
 
   /**
-   * Find nearest drivers. Fan out GEOSEARCH to every shard and merge the
-   * per-shard results by distance.
+   * Find nearest ONLINE drivers. Fan out GEOSEARCH to every shard, merge by
+   * distance, then filter by status in one pipelined MGET.
    */
   async findNearby(lat, lng, radiusM = 3000, limit = 10) {
     const perShard = await Promise.all(
@@ -76,12 +85,52 @@ export class GeoIndex {
           .catch(() => [])
       )
     );
-    return perShard
+    const merged = perShard
       .flat()
       .map(([driverId, dist, [dLng, dLat]]) => ({
         driverId, distM: Math.round(parseFloat(dist)), lat: parseFloat(dLat), lng: parseFloat(dLng)
       }))
-      .sort((a, b) => a.distM - b.distM)
+      .sort((a, b) => a.distM - b.distM);
+
+    if (!merged.length) return [];
+    const statuses = await this.meta.mget(merged.map((c) => `driver:status:${c.driverId}`));
+    const idles = await this.meta.mget(merged.map((c) => `driver:lastTripEnd:${c.driverId}`));
+    const now = Date.now();
+    return merged
+      .map((c, i) => ({
+        ...c,
+        status: statuses[i] || 'offline',
+        idleS: idles[i] ? Math.max(0, Math.floor((now - parseInt(idles[i], 10)) / 1000)) : 0
+      }))
+      .filter((c) => c.status === 'online')
       .slice(0, limit);
+  }
+
+  // ------------------------------------------------------------- status ---
+  async setStatus(driverId, status, { tripId } = {}) {
+    await this.meta.set(`driver:status:${driverId}`, status);
+    if (status === 'on_trip' && tripId) {
+      await this.meta.set(`driver:trip:${driverId}`, tripId);
+    }
+    if (status === 'online') {
+      await this.meta.del(`driver:trip:${driverId}`);
+      await this.meta.set(`driver:lastTripEnd:${driverId}`, String(Date.now()));
+    }
+    if (status === 'offline') {
+      await this.meta.del(`driver:trip:${driverId}`);
+      await this.removeDriver(driverId);
+    }
+  }
+
+  getStatus(driverId) { return this.meta.get(`driver:status:${driverId}`); }
+  getActiveTrip(driverId) { return this.meta.get(`driver:trip:${driverId}`); }
+
+  async onlineCount() {
+    // Dev-scale introspection for /health and metrics (KEYS is O(N); a prod
+    // system would maintain a counter instead).
+    const keys = await this.meta.keys('driver:status:*');
+    if (!keys.length) return 0;
+    const vals = await this.meta.mget(keys);
+    return vals.filter((v) => v === 'online' || v === 'on_trip').length;
   }
 }
