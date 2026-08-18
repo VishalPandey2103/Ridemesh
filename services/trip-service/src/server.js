@@ -12,6 +12,7 @@ import { enqueueEvent, startOutboxPoller } from '@ridemesh/shared/src/outbox.js'
 import { haversineM, cellForLocation } from '@ridemesh/shared/src/geo.js';
 import { initMetrics } from '@ridemesh/shared/src/metrics.js';
 import { createPool, processedOnce } from './db.js';
+import { canTransition } from './state.js';
 
 /**
  * Trip Service — owns the trip aggregate and its lifecycle. It is the saga's
@@ -134,6 +135,61 @@ app.get('/api/trips/:id', requireUser, asyncHandler(async (req, res) => {
     throw new ApiError(403, 'Not your trip');
   }
   res.json(trip);
+}));
+
+// -------------------------------------- internal: trip fetch (socket auth)
+app.get('/internal/trips/:id', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, rider_id, driver_id, status, payment_status FROM trips WHERE id = $1`,
+    [req.params.id]);
+  if (!rows[0]) throw new ApiError(404, 'Trip not found');
+  res.json(rows[0]);
+}));
+
+// ---------------------------------------- internal: GPS route breadcrumbs
+app.post('/internal/trips/:id/route', asyncHandler(async (req, res) => {
+  const { lat, lng } = req.body || {};
+  await pool.query(
+    `INSERT INTO trip_route_points (trip_id, lat, lng)
+     SELECT $1, $2, $3 WHERE EXISTS
+       (SELECT 1 FROM trips WHERE id = $1 AND status = 'in_progress')`,
+    [req.params.id, lat, lng]);
+  res.json({ ok: true });
+}));
+
+// ------------------------- internal: driver-driven lifecycle transitions
+app.post('/internal/trips/:id/status', asyncHandler(async (req, res) => {
+  const { status: next, driverId } = req.body || {};
+  if (!['driver_arriving', 'in_progress'].includes(next)) {
+    throw new ApiError(400, 'status must be driver_arriving|in_progress');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(`SELECT * FROM trips WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    const trip = rows[0];
+    if (!trip) throw new ApiError(404, 'Trip not found');
+    if (trip.driver_id !== driverId) throw new ApiError(403, 'Not the assigned driver');
+    if (!canTransition(trip.status, next)) {
+      throw new ApiError(409, `Illegal transition ${trip.status} -> ${next}`);
+    }
+    const upd = await client.query(
+      `UPDATE trips SET status=$2,
+              started_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE started_at END,
+              updated_at=now()
+       WHERE id=$1 RETURNING *`,
+      [trip.id, next]);
+    const updated = upd.rows[0];
+    await client.query('COMMIT');
+
+    pushTripUpdate(updated);
+    res.json({ tripId: updated.id, status: updated.status });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }));
 
 app.use(notFound);
