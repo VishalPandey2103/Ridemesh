@@ -1,0 +1,10 @@
+{
+  "name": "@ridemesh/pricing-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ridemesh/shared": "*",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1"
+  }
+}
