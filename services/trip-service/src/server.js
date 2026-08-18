@@ -19,7 +19,9 @@ import { canTransition } from './state.js';
  * "source of facts": every durable state change is committed to trips_db
  * together with an outbox event in one transaction, and downstream services
  * (matching, payment, notification) react to those events. There is no
- * orchestrator — this is a choreographed saga (ADR-003).
+ * orchestrator — this is a choreographed saga (ADR-003), and the
+ * compensations are themselves just more transitions + events
+ * (payment.failed -> payment_status='failed').
  */
 const env = requireEnv(['PORT', 'DATABASE_URL', 'REDIS_URL', 'RABBIT_URL',
   'PRICING_SERVICE_URL', 'LOCATION_SERVICE_URL']);
@@ -30,6 +32,7 @@ const emitter = new Emitter(createRedis(env.REDIS_URL));
 const bus = await createBus({ url: env.RABBIT_URL, service: 'trip-service', logger });
 
 const tripsCreated = metrics.counter('trips_created_total', 'Trips requested');
+const tripsCompleted = metrics.counter('trips_completed_total', 'Trips completed');
 
 // Fallback fare math for when pricing-service is down (breaker open). Same
 // default rates; a slightly-imperfect fare beats a stuck trip. All money is
@@ -160,8 +163,8 @@ app.post('/internal/trips/:id/route', asyncHandler(async (req, res) => {
 // ------------------------- internal: driver-driven lifecycle transitions
 app.post('/internal/trips/:id/status', asyncHandler(async (req, res) => {
   const { status: next, driverId } = req.body || {};
-  if (!['driver_arriving', 'in_progress'].includes(next)) {
-    throw new ApiError(400, 'status must be driver_arriving|in_progress');
+  if (!['driver_arriving', 'in_progress', 'completed'].includes(next)) {
+    throw new ApiError(400, 'status must be driver_arriving|in_progress|completed');
   }
   const client = await pool.connect();
   try {
@@ -173,17 +176,66 @@ app.post('/internal/trips/:id/status', asyncHandler(async (req, res) => {
     if (!canTransition(trip.status, next)) {
       throw new ApiError(409, `Illegal transition ${trip.status} -> ${next}`);
     }
-    const upd = await client.query(
-      `UPDATE trips SET status=$2,
-              started_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE started_at END,
-              updated_at=now()
-       WHERE id=$1 RETURNING *`,
-      [trip.id, next]);
-    const updated = upd.rows[0];
+
+    let updated;
+    if (next === 'completed') {
+      // Billed distance = sum of haversine between consecutive breadcrumbs;
+      // fall back to the request-time estimate if too few points landed.
+      const { rows: pts } = await client.query(
+        `SELECT lat, lng FROM trip_route_points WHERE trip_id = $1 ORDER BY id`, [trip.id]);
+      let distanceM = 0;
+      for (let i = 1; i < pts.length; i++) {
+        distanceM += haversineM(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng);
+      }
+      if (pts.length < 2) {
+        distanceM = Math.round(haversineM(trip.pickup_lat, trip.pickup_lng, trip.drop_lat, trip.drop_lng) * 1.4);
+      }
+      const durationS = trip.started_at
+        ? Math.max(60, Math.round((Date.now() - new Date(trip.started_at).getTime()) / 1000))
+        : Math.round(distanceM / 6);
+      const surge = Number(trip.surge_multiplier);
+
+      let farePaise;
+      try {
+        const q = await callService('pricing', `${env.PRICING_SERVICE_URL}/internal/quote`, {
+          method: 'POST', body: { distanceM, durationS, surge }
+        });
+        farePaise = q.farePaise;
+      } catch (e) {
+        farePaise = fallbackFare(distanceM, durationS, surge);
+        logger.warn({ tripId: trip.id, err: e.message }, 'pricing down, used fallback fare');
+      }
+
+      const upd = await client.query(
+        `UPDATE trips SET status='completed', distance_m=$2, duration_s=$3,
+                final_fare_paise=$4, completed_at=now(), updated_at=now()
+         WHERE id=$1 RETURNING *`,
+        [trip.id, distanceM, durationS, farePaise]);
+      updated = upd.rows[0];
+      // trip.completed is what triggers payment — MUST survive a crash,
+      // hence outbox in the same transaction as the status flip.
+      await enqueueEvent(client, EVENTS.TRIP_COMPLETED, {
+        tripId: trip.id, riderId: trip.rider_id, driverId: trip.driver_id,
+        amountPaise: farePaise, distanceM, durationS, surge
+      });
+    } else {
+      const upd = await client.query(
+        `UPDATE trips SET status=$2,
+                started_at = CASE WHEN $2 = 'in_progress' THEN now() ELSE started_at END,
+                updated_at=now()
+         WHERE id=$1 RETURNING *`,
+        [trip.id, next]);
+      updated = upd.rows[0];
+    }
     await client.query('COMMIT');
 
+    if (next === 'completed') {
+      tripsCompleted.inc({ service: metrics.service });
+      callService('location', `${env.LOCATION_SERVICE_URL}/internal/drivers/${driverId}/status`,
+        { method: 'POST', body: { status: 'online' } }).catch(() => {});
+    }
     pushTripUpdate(updated);
-    res.json({ tripId: updated.id, status: updated.status });
+    res.json({ tripId: updated.id, status: updated.status, finalFarePaise: updated.final_fare_paise });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     throw e;
@@ -214,6 +266,24 @@ await bus.subscribe({
           [payload.tripId]);
         if (rows[0]) pushTripUpdate(rows[0]);
       }
+    });
+  }
+});
+
+await bus.subscribe({
+  queue: 'trip.payment-events',
+  bindings: [EVENTS.PAYMENT_CAPTURED, EVENTS.PAYMENT_FAILED, EVENTS.PAYMENT_REFUNDED],
+  handler: async (payload, key, props) => {
+    const map = {
+      [EVENTS.PAYMENT_CAPTURED]: 'captured',
+      [EVENTS.PAYMENT_FAILED]: 'failed',
+      [EVENTS.PAYMENT_REFUNDED]: 'refunded'
+    };
+    await processedOnce(pool, props.messageId, async (client) => {
+      const { rows } = await client.query(
+        `UPDATE trips SET payment_status=$2, updated_at=now() WHERE id=$1 RETURNING *`,
+        [payload.tripId, map[key]]);
+      if (rows[0]) pushTripUpdate(rows[0]);
     });
   }
 });
