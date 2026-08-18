@@ -1,7 +1,7 @@
 import express from 'express';
 import { Emitter } from '@socket.io/redis-emitter';
 import { createLogger, httpLogger } from '@ridemesh/shared/src/logger.js';
-import { requireEnv } from '@ridemesh/shared/src/env.js';
+import { requireEnv, envInt } from '@ridemesh/shared/src/env.js';
 import { ApiError, asyncHandler, errorHandler, notFound } from '@ridemesh/shared/src/errors.js';
 import { userFromHeaders, requireUser } from '@ridemesh/shared/src/auth.js';
 import { createRedis } from '@ridemesh/shared/src/redis.js';
@@ -12,7 +12,7 @@ import { enqueueEvent, startOutboxPoller } from '@ridemesh/shared/src/outbox.js'
 import { haversineM, cellForLocation } from '@ridemesh/shared/src/geo.js';
 import { initMetrics } from '@ridemesh/shared/src/metrics.js';
 import { createPool, processedOnce } from './db.js';
-import { canTransition } from './state.js';
+import { canTransition, FEE_ON_CANCEL } from './state.js';
 
 /**
  * Trip Service — owns the trip aggregate and its lifecycle. It is the saga's
@@ -21,7 +21,7 @@ import { canTransition } from './state.js';
  * (matching, payment, notification) react to those events. There is no
  * orchestrator — this is a choreographed saga (ADR-003), and the
  * compensations are themselves just more transitions + events
- * (payment.failed -> payment_status='failed').
+ * (payment.failed -> payment_status='failed'; cancel -> cancellation fee).
  */
 const env = requireEnv(['PORT', 'DATABASE_URL', 'REDIS_URL', 'RABBIT_URL',
   'PRICING_SERVICE_URL', 'LOCATION_SERVICE_URL']);
@@ -33,6 +33,8 @@ const bus = await createBus({ url: env.RABBIT_URL, service: 'trip-service', logg
 
 const tripsCreated = metrics.counter('trips_created_total', 'Trips requested');
 const tripsCompleted = metrics.counter('trips_completed_total', 'Trips completed');
+
+const CANCELLATION_FEE_PAISE = envInt('CANCELLATION_FEE_PAISE', 2500);
 
 // Fallback fare math for when pricing-service is down (breaker open). Same
 // default rates; a slightly-imperfect fare beats a stuck trip. All money is
@@ -138,6 +140,47 @@ app.get('/api/trips/:id', requireUser, asyncHandler(async (req, res) => {
     throw new ApiError(403, 'Not your trip');
   }
   res.json(trip);
+}));
+
+// ------------------------------------------------------------- rider cancel
+app.post('/api/trips/:id/cancel', requireUser, asyncHandler(async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Row lock serializes cancel against concurrent driver transitions.
+    const { rows } = await client.query(`SELECT * FROM trips WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    const trip = rows[0];
+    if (!trip) throw new ApiError(404, 'Trip not found');
+    if (trip.rider_id !== req.user.id) throw new ApiError(403, 'Not your trip');
+    if (!canTransition(trip.status, 'cancelled')) {
+      throw new ApiError(409, `Cannot cancel a trip in status ${trip.status}`);
+    }
+    const feePaise = FEE_ON_CANCEL.has(trip.status) ? CANCELLATION_FEE_PAISE : 0;
+    const upd = await client.query(
+      `UPDATE trips SET status='cancelled', cancellation_fee_paise=$2,
+              payment_status = CASE WHEN $2 = 0 THEN 'waived' ELSE payment_status END,
+              updated_at=now()
+       WHERE id=$1 RETURNING *`,
+      [trip.id, feePaise]);
+    await enqueueEvent(client, EVENTS.TRIP_CANCELLED, {
+      tripId: trip.id, riderId: trip.rider_id, driverId: trip.driver_id, feePaise
+    });
+    await client.query('COMMIT');
+
+    // Compensation for the driver's availability: put them back online.
+    if (trip.driver_id) {
+      callService('location', `${env.LOCATION_SERVICE_URL}/internal/drivers/${trip.driver_id}/status`,
+        { method: 'POST', body: { status: 'online' } }).catch(() => {});
+      emitter.to(`driver:${trip.driver_id}`).emit('trip:cancelled', { tripId: trip.id });
+    }
+    pushTripUpdate(upd.rows[0]);
+    res.json({ tripId: trip.id, status: 'cancelled', feePaise });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }));
 
 // -------------------------------------- internal: trip fetch (socket auth)
