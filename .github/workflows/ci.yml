@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No lockfile is committed, so `npm install` (not `npm ci`) resolves
+      # the workspace tree across shared/ and services/*.
+      - name: Install workspace dependencies
+        run: npm install
+
+      # Pure-logic suites only: geohash, driver ranking, the trip state
+      # machine and fare math. None of them need Redis, Postgres or Rabbit,
+      # which is what keeps CI fast and deterministic.
+      - name: Run tests
+        run: npm test
+
+  build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build service image
+        run: docker build -t ridemesh:${{ github.sha }} .
+
+      # compose interpolates ${...} from the environment, so seed it with the
+      # committed example values before asking it to validate.
+      - name: Validate compose file
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
