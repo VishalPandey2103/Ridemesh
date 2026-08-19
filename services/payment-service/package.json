@@ -1,0 +1,11 @@
+{
+  "name": "@ridemesh/payment-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ridemesh/shared": "*",
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "ioredis": "^5.4.1"
+  }
+}
