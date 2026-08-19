@@ -1,0 +1,9 @@
+{
+  "name": "@ridemesh/notification-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ridemesh/shared": "*",
+    "express": "^4.19.2"
+  }
+}
