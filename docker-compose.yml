@@ -1,0 +1,195 @@
+# RideMesh — full local stack.
+#   docker compose up --build
+# Exposed on host: gateway :8080, websockets :3002, rabbit UI :15672,
+# prometheus :9090, grafana :3000, jaeger UI :16686.
+# Everything else stays on the internal network — the gateway is the only
+# application entrypoint, exactly like production.
+
+services:
+  # ------------------------------------------------------------ backbone --
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ridemesh
+      POSTGRES_PASSWORD: ridemesh
+      POSTGRES_DB: ridemesh
+    volumes:
+      # init script creates users_db / trips_db / payments_db + all tables.
+      # One CONTAINER, three DATABASES: honors data-per-service ownership
+      # (no cross-DB joins possible) without burning RAM on 3 postgres
+      # processes on a laptop. Prod would be 3 instances.
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ridemesh"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "15672:15672"   # management UI (guest/guest) — watch queues live
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------- observability --
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # trace UI
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+
+  # ------------------------------------------------------- app services --
+  # All share the one built image; `command` selects the service. The
+  # x-service anchor keeps 8 near-identical blocks DRY.
+  gateway:
+    build: .
+    command: node --import ./instrumentation.mjs services/gateway/src/server.js
+    ports:
+      - "8080:8080"
+    environment:
+      # &common-env: YAML anchor — every other service merges this block
+      # with <<: *common-env instead of repeating 12 vars eight times.
+      <<: &common-env
+        NODE_ENV: production
+        JWT_SECRET: dev-secret-change-me
+        REDIS_URL: redis://redis:6379
+        RABBIT_URL: amqp://rabbitmq:5672
+        TRACING_ENABLED: "true"
+        OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+        USER_SERVICE_URL: http://user-service:3001
+        LOCATION_SERVICE_URL: http://location-service:3002
+        MATCHING_SERVICE_URL: http://matching-service:3003
+        TRIP_SERVICE_URL: http://trip-service:3004
+        PRICING_SERVICE_URL: http://pricing-service:3005
+        PAYMENT_SERVICE_URL: http://payment-service:3006
+      PORT: "8080"
+      OTEL_SERVICE_NAME: gateway
+      RATE_LIMIT_PER_MIN: "300"
+    depends_on:
+      redis: { condition: service_healthy }
+
+  user-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/user-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3001"
+      OTEL_SERVICE_NAME: user-service
+      DATABASE_URL: postgres://ridemesh:ridemesh@postgres:5432/users_db
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  location-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/location-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3002"
+      OTEL_SERVICE_NAME: location-service
+      # Geo sharding: comma-separated Redis URLs. One entry here; add more
+      # to fan drivers across instances by geohash prefix (see geo.js).
+      GEO_REDIS_URLS: redis://redis:6379
+      TRIP_SERVICE_URL: http://trip-service:3004
+      MATCHING_SERVICE_URL: http://matching-service:3003
+    ports:
+      - "3002:3002"     # exposed: browsers/simulators connect sockets here
+    depends_on:
+      redis: { condition: service_healthy }
+
+  matching-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/matching-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3003"
+      OTEL_SERVICE_NAME: matching-service
+    depends_on:
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  trip-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/trip-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3004"
+      OTEL_SERVICE_NAME: trip-service
+      DATABASE_URL: postgres://ridemesh:ridemesh@postgres:5432/trips_db
+      CANCELLATION_FEE_PAISE: "2500"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  pricing-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/pricing-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3005"
+      OTEL_SERVICE_NAME: pricing-service
+      SURGE_INTERVAL_MS: "60000"
+    depends_on:
+      redis: { condition: service_healthy }
+
+  payment-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/payment-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3006"
+      OTEL_SERVICE_NAME: payment-service
+      DATABASE_URL: postgres://ridemesh:ridemesh@postgres:5432/payments_db
+      MOCK_FAIL_RATE: "0.1"
+      PAYMENT_MAX_ATTEMPTS: "3"
+      PAYMENT_RETRY_DELAY_MS: "8000"
+      # RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET: set to use real test mode
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  notification-service:
+    build: .
+    command: node --import ./instrumentation.mjs services/notification-service/src/server.js
+    environment:
+      <<: *common-env
+      PORT: "3007"
+      OTEL_SERVICE_NAME: notification-service
+    depends_on:
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+volumes:
+  pgdata:

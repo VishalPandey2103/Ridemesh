@@ -1,0 +1,18 @@
+# Prometheus scrape config — every RideMesh service exposes /metrics
+# (prom-client). 5s interval is aggressive but fine locally and makes the
+# Grafana graphs react fast during demos/load tests.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: ridemesh
+    static_configs:
+      - targets:
+          - gateway:8080
+          - user-service:3001
+          - location-service:3002
+          - matching-service:3003
+          - trip-service:3004
+          - pricing-service:3005
+          - payment-service:3006
+          - notification-service:3007
