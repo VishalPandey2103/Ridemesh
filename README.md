@@ -1,4 +1,4 @@
-# RideMesh — Distributed Ride-Hailing Backend (Uber/Ola-lite)
+# RideMesh — Distributed Ride-Hailing Backend
 
 Eight Node.js/Express microservices coordinating a complete ride lifecycle —
 geospatial driver matching, real-time WebSocket dispatch, choreographed
